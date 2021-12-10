@@ -1,3 +1,4 @@
+import hfai
 from data.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_Pred
 from exp.exp_basic import Exp_Basic
 from models.model import Informer, InformerStack
@@ -127,13 +128,18 @@ class Exp_Informer(Exp_Basic):
         vali_data, vali_loader = self._get_data(flag = 'val')
         test_data, test_loader = self._get_data(flag = 'test')
 
+        # 状态信息，用于描述执行的位置
+        steps == 0
+
+        # 若模型存在，加载之前的模型
         path = os.path.join(self.args.checkpoints, setting)
+        best_model_path = os.path.join(path, 'checkpoint.pth')
         if not os.path.exists(path):
             os.makedirs(path)
-
-        time_now = time.time()
+        else:
+            if os.path.exists(best_model_path):
+                self.model.load_state_dict(torch.load(best_model_path))
         
-        train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
         
         model_optim = self._select_optimizer()
@@ -142,29 +148,28 @@ class Exp_Informer(Exp_Basic):
         if self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
 
-        for epoch in range(self.args.train_epochs):
-            iter_count = 0
+        # 获取当前训练的进度位置
+        for epoch in range(hfai.get_whole_life_state()//len(train_loader)%self.args.train_epochs, self.args.train_epochs):
             train_loss = []
             
             self.model.train()
-            epoch_time = time.time()
             for i, (batch_x,batch_y,batch_x_mark,batch_y_mark) in enumerate(train_loader):
-                iter_count += 1
-                
+                # 对于之前的已经训练过的轮次，直接跳过
+                if epoch*len(train_loader) + i < hfai.get_whole_life_state():
+                    print(f'Epoch: {epoch+1}/{self.args.train_epochs}, Step: {i+1}/{len(train_loader)}, Skip.')
+                    continue
+
                 model_optim.zero_grad()
-                pred, true = self._process_one_batch(
-                    train_data, batch_x, batch_y, batch_x_mark, batch_y_mark)
+                pred, true = self._process_one_batch(train_data, batch_x, batch_y, batch_x_mark, batch_y_mark)
                 loss = criterion(pred, true)
                 train_loss.append(loss.item())
-                
+
                 if (i+1) % 100==0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
-                    speed = (time.time()-time_now)/iter_count
-                    left_time = speed*((self.args.train_epochs - epoch)*train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
-                    iter_count = 0
-                    time_now = time.time()
-                
+                   
+                # 状态更新
+                steps += 1
+
                 if self.args.use_amp:
                     scaler.scale(loss).backward()
                     scaler.step(model_optim)
@@ -173,13 +178,19 @@ class Exp_Informer(Exp_Basic):
                     loss.backward()
                     model_optim.step()
 
-            print("Epoch: {} cost time: {}".format(epoch+1, time.time()-epoch_time))
+                # 收到打断信号，保存模型，设置当前执行的状态信息
+                if hfai.receive_suspend_command():
+                    vali_loss = self.vali(vali_data, vali_loader, criterion)
+                    early_stopping(vali_loss, self.model, path)
+                    hfai.set_whole_life_state(steps)
+                    time.sleep(5)
+                    hfai.go_suspend()
+
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
 
-            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
-                epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+            print("Epoch: {0} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(epoch + 1, train_loss, vali_loss, test_loss))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
@@ -187,7 +198,6 @@ class Exp_Informer(Exp_Basic):
 
             adjust_learning_rate(model_optim, epoch+1, self.args)
             
-        best_model_path = path+'/'+'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
         
         return self.model

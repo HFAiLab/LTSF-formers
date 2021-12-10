@@ -129,7 +129,7 @@ class Exp_Informer(Exp_Basic):
         test_data, test_loader = self._get_data(flag = 'test')
 
         # 状态信息，用于描述执行的位置
-        steps == 0
+        steps = 0
 
         # 若模型存在，加载之前的模型
         path = os.path.join(self.args.checkpoints, setting)
@@ -190,7 +190,7 @@ class Exp_Informer(Exp_Basic):
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
 
-            print("Epoch: {0} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(epoch + 1, train_loss, vali_loss, test_loss))
+            print("Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f}".format(epoch + 1, train_loss, vali_loss, test_loss))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")

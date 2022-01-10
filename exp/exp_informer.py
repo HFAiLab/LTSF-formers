@@ -1,5 +1,6 @@
 import hfai
 from data.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_Pred
+from exp.exp_basic import Exp_Basic
 from models.model import Informer, InformerStack
 
 from utils.tools import EarlyStopping, adjust_learning_rate
@@ -11,8 +12,6 @@ import torch
 import torch.nn as nn
 from torch import optim
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel
 
 import os
 import time
@@ -20,11 +19,17 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
+class Exp_Informer(Exp_Basic):
+    def __init__(self, args):
+        super(Exp_Informer, self).__init__(args)
 
-class Exp_Informer:
-    def __init__(self, args, local_rank):
-        self.args = args
+        self.save_step_path = os.path.join(self.args.checkpoints, "steps")
+        if not os.path.exists(self.save_step_path):
+            os.makedirs(self.args.checkpoints, exist_ok=True)
+        self.steps = hfai.get_whole_life_state()  # 记录当前训练的位置
 
+    
+    def _build_model(self):
         model_dict = {
             'informer':Informer,
             'informerstack':InformerStack,
@@ -41,7 +46,7 @@ class Exp_Informer:
                 self.args.factor,
                 self.args.d_model, 
                 self.args.n_heads, 
-                e_layers,
+                e_layers, # self.args.e_layers,
                 self.args.d_layers, 
                 self.args.d_ff,
                 self.args.dropout, 
@@ -52,18 +57,12 @@ class Exp_Informer:
                 self.args.output_attention,
                 self.args.distil,
                 self.args.mix,
-            ).cuda()
-        else:
-            raise "incorrect model"
-
-        self.model = DistributedDataParallel(model, device_ids=[local_rank])
-        self.model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        self.rank = local_rank
-
-        self.save_step_path = os.path.join(self.args.checkpoints, "steps")
-        if self.rank == 0 and not os.path.exists(self.save_step_path):
-            os.makedirs(self.args.checkpoint, exist_ok=True)
-        self.steps = 0
+                self.device
+            ).float()
+        
+        if self.args.use_multi_gpu and self.args.use_gpu:
+            model = nn.DataParallel(model, device_ids=self.args.device_ids)
+        return model
 
     def _get_data(self, flag):
         args = self.args
@@ -82,12 +81,12 @@ class Exp_Informer:
         timeenc = 0 if args.embed!='timeF' else 1
 
         if flag == 'test':
-            drop_last = True; batch_size = args.batch_size; freq=args.freq
+            shuffle_flag = False; drop_last = True; batch_size = args.batch_size; freq=args.freq
         elif flag=='pred':
-            drop_last = False; batch_size = 1; freq=args.detail_freq
+            shuffle_flag = False; drop_last = False; batch_size = 1; freq=args.detail_freq
             Data = Dataset_Pred
         else:
-            drop_last = True; batch_size = args.batch_size; freq=args.freq
+            shuffle_flag = True; drop_last = True; batch_size = args.batch_size; freq=args.freq
         data_set = Data(
             root_path=args.root_path,
             data_path=args.data_path,
@@ -98,13 +97,21 @@ class Exp_Informer:
             inverse=args.inverse,
             timeenc=timeenc,
             freq=freq,
+            cols=args.cols
         )
         print(flag, len(data_set))
-
-        datasampler = DistributedSampler(data_set)
-        data_loader = DataLoader(data_set, batch_size, sampler=datasampler, pin_memory=True, drop_last=drop_last)
+        data_loader = DataLoader(
+            data_set,
+            batch_size=batch_size,
+            shuffle=shuffle_flag,
+            num_workers=args.num_workers,
+            drop_last=drop_last)
 
         return data_set, data_loader
+
+    def _select_optimizer(self):
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        return model_optim
     
     def _select_criterion(self):
         criterion =  nn.MSELoss()
@@ -123,65 +130,90 @@ class Exp_Informer:
         return total_loss
 
     def train(self, setting):
-
         # 若模型存在，加载之前的模型
         if os.path.exists(os.path.join(self.save_step_path, 'optimizer.pt')):
             self.load()
-            
+
         # 保存当前setting下的最好模型    
         path = os.path.join(self.args.checkpoints, setting)
         best_model_path = os.path.join(path, 'checkpoint.pth')
-        if self.rank ==0 and not os.path.exists(path):
+        if not os.path.exists(path):
             os.makedirs(path)
-        
+            
         train_data, train_loader = self._get_data(flag = 'train')
         vali_data, vali_loader = self._get_data(flag = 'val')
         test_data, test_loader = self._get_data(flag = 'test')
 
+        path = os.path.join(self.args.checkpoints, setting)
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+        time_now = time.time()
+        
+        train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+        
+        self.model_optim = self._select_optimizer()
         criterion =  self._select_criterion()
 
-        # 获取当前训练的进度位置
+        if self.args.use_amp:
+            scaler = torch.cuda.amp.GradScaler()
+
         for epoch in range(self.steps//len(train_loader)%self.args.train_epochs, self.args.train_epochs):
+            iter_count = 0
             train_loss = []
             
             self.model.train()
+            epoch_time = time.time()
             for i, (batch_x,batch_y,batch_x_mark,batch_y_mark) in enumerate(train_loader):
-                # 对于之前的已经训练过的轮次，直接跳过
+                 # 对于之前的已经训练过的轮次，直接跳过
                 if epoch*len(train_loader) + i < self.steps:
                     print(f'Epoch: {epoch+1}/{self.args.train_epochs}, Step: {i+1}/{len(train_loader)}, Skip.')
                     continue
 
+                iter_count += 1
+                
                 self.model_optim.zero_grad()
-                pred, true = self._process_one_batch(train_data, batch_x, batch_y, batch_x_mark, batch_y_mark)
+                pred, true = self._process_one_batch(
+                    train_data, batch_x, batch_y, batch_x_mark, batch_y_mark)
                 loss = criterion(pred, true)
                 train_loss.append(loss.item())
-                   
-                # 状态更新
+                
+                if (i+1) % 100==0:
+                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                    speed = (time.time()-time_now)/iter_count
+                    left_time = speed*((self.args.train_epochs - epoch)*train_steps - i)
+                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                    iter_count = 0
+                    time_now = time.time()
+                
+                if self.args.use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(self.model_optim)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    self.model_optim.step()
+                
                 self.steps += 1
-                loss.backward()
-                self.model_optim.step()
 
                 # 收到打断信号，保存模型，设置当前执行的状态信息
-                if self.rank == 0 and hfai.receive_suspend_command():
+                if hfai.receive_suspend_command():
                     self.save()
-                    vali_loss = self.vali(vali_data, vali_loader, criterion)
-                    early_stopping(vali_loss, self.model, path)
                     hfai.set_whole_life_state(self.steps)
                     time.sleep(5)
                     hfai.go_suspend()
 
+            print("Epoch: {} cost time: {}".format(epoch+1, time.time()-epoch_time))
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
 
-            if self.rank == 0:
-                print("Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f}".format(epoch + 1, train_loss, vali_loss, test_loss))
-                self.save()
-
+            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
+                epoch + 1, train_steps, train_loss, vali_loss, test_loss))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
-                print("Rank: {}, Early stopping".format(self.rank))
+                print("Early stopping")
                 break
 
             adjust_learning_rate(self.model_optim, epoch+1, self.args)
@@ -255,28 +287,34 @@ class Exp_Informer:
         return
 
     def _process_one_batch(self, dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark):
-        batch_x = batch_x.float()
+        batch_x = batch_x.float().to(self.device)
         batch_y = batch_y.float()
 
-        batch_x_mark = batch_x_mark.float()
-        batch_y_mark = batch_y_mark.float()
+        batch_x_mark = batch_x_mark.float().to(self.device)
+        batch_y_mark = batch_y_mark.float().to(self.device)
 
         # decoder input
         if self.args.padding==0:
             dec_inp = torch.zeros([batch_y.shape[0], self.args.pred_len, batch_y.shape[-1]]).float()
-        else:
+        elif self.args.padding==1:
             dec_inp = torch.ones([batch_y.shape[0], self.args.pred_len, batch_y.shape[-1]]).float()
-        dec_inp = torch.cat([batch_y[:,:self.args.label_len,:], dec_inp], dim=1).float()
+        dec_inp = torch.cat([batch_y[:,:self.args.label_len,:], dec_inp], dim=1).float().to(self.device)
         # encoder - decoder
-
-        if self.args.output_attention:
-            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+        if self.args.use_amp:
+            with torch.cuda.amp.autocast():
+                if self.args.output_attention:
+                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                else:
+                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
         else:
-            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            if self.args.output_attention:
+                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+            else:
+                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
         if self.args.inverse:
             outputs = dataset_object.inverse_transform(outputs)
         f_dim = -1 if self.args.features=='MS' else 0
-        batch_y = batch_y[:,-self.args.pred_len:,f_dim:]
+        batch_y = batch_y[:,-self.args.pred_len:,f_dim:].to(self.device)
 
         return outputs, batch_y
 
@@ -291,5 +329,3 @@ class Exp_Informer:
         torch.save(self.model_optim.state_dict(), os.path.join(self.save_step_path, 'optimizer.pt'))
         torch.save(self.steps, os.path.join(self.save_step_path, 'other'))
         torch.cuda.empty_cache()
-
-

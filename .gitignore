@@ -1,6 +1,9 @@
 *.pyc
 /results
+/output
+/outputs
 /checkpoints
 .ipynb_checkpoints
 __pycache__
-/.vscode
+.vscode
+.idea

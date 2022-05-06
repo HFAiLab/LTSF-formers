@@ -23,8 +23,8 @@ def get_dataloader(data_name: str, seq_len: int, label_len: int, pred_len: int, 
     )
 
     x, y, x_mark, y_mark = data[[0]][0]
-    encoder_dim = x.size(-1)
-    decoder_dim = y.size(-1)
+    encoder_dim = x.shape[-1]
+    decoder_dim = y.shape[-1]
     output_dim = decoder_dim if features != 'MS' else 1
 
     return dataloader, data.get_scaler(), encoder_dim, decoder_dim, output_dim

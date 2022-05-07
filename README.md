@@ -40,9 +40,6 @@
     python train.py --ds ETTh1 --model autoformer
    ```
 
-## Samples
-下面是一些长时序预测的效果图：
-
 
 ## References
 + [Informer](https://github.com/zhouhaoyi/Informer2020)

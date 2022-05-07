@@ -40,8 +40,6 @@ The raw data is from [Github:Autoformer](https://github.com/thuml/Autoformer) , 
     python train.py --ds ETTh1 --model autoformer
    ```
 
-## Samples
-
 
 ## References
 + [Informer](https://github.com/zhouhaoyi/Informer2020)

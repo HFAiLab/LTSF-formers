@@ -16,7 +16,7 @@ which aim at conducting Long-Term Series Forecasting (LTSF).
 
 
 ## Training
-The raw data is from [Github:Autoformer](https://github.com/thuml/Autoformer) , which is integrated into the dataset warehouse, `hfai.datasets`, including: `ETTh1`, `ETTh2`, `ETTm1`, `ETTm2`, `exchange_rate`, `electricity`, `national_illness`, `traffic`。 使用参考[hfai开发文档](#)。
+The raw data is from [Github:Autoformer](https://github.com/thuml/Autoformer) , which is integrated into the dataset warehouse, `hfai.datasets`, including: `ETTh1`, `ETTh2`, `ETTm1`, `ETTm2`, `exchange_rate`, `electricity`, `national_illness`, `traffic`
 
 1. train informer
 
